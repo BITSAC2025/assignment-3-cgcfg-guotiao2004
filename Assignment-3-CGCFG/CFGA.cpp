@@ -43,48 +43,65 @@ void CFGAnalysis::analyze(SVF::ICFG *icfg)
             //@{
             std::vector<unsigned> trace;
             std::vector<unsigned> contextStack;
-            std::set<unsigned> activeNodes;
+            std::set<unsigned> activeNodes; // 用于当前路径的环路检测
 
             std::function<void(unsigned)> traverse = [&](unsigned u) {
-                // Cycle detection
-                if (activeNodes.find(u) != activeNodes.end()) {
+                // 1. Cycle detection (Path-sensitive)
+                if (activeNodes.count(u)) {
                     return;
                 }
 
+                // 2. Add to current path
                 activeNodes.insert(u);
                 trace.push_back(u);
 
+                // 3. Check if we hit the sink
                 if (u == snk) {
                     this->recordPath(trace);
                 } 
                 else {
                     const ICFGNode* node = icfg->getICFGNode(u);
+                    
                     for (const auto* edge : node->getOutEdges()) {
                         unsigned v = edge->getDstNode()->getId();
 
+                        // Case A: Function Call
                         if (edge->isCallCFGEdge()) {
-                            contextStack.push_back(u);
+                            contextStack.push_back(u); // Push CallSite ID
                             traverse(v);
                             contextStack.pop_back();
                         }
+                        // Case B: Function Return
                         else if (edge->isRetCFGEdge()) {
                             if (!contextStack.empty()) {
-                                unsigned caller = contextStack.back();
-                                contextStack.pop_back();
+                                unsigned callID = contextStack.back();
+                                
+                                // --- CRITICAL FIX: Context Matching ---
+                                // 检查当前这条返回边(edge)是否对应栈顶的调用(callID)
+                                // 只有当 edge->dst (返回点) 等于 callID 对应的 (RetICFGNode) 时才允许通过
+                                const ICFGNode* callNode = icfg->getICFGNode(callID);
+                                if (const CallICFGNode* cNode = SVFUtil::dyn_cast<CallICFGNode>(callNode)) {
+                                    if (cNode->getRetICFGNode()->getId() != v) {
+                                        continue; // 这是一个去往其他函数的返回边，跳过
+                                    }
+                                }
+
+                                contextStack.pop_back(); // 匹配成功，弹出栈
                                 traverse(v);
-                                contextStack.push_back(caller);
+                                contextStack.push_back(callID); // 回溯恢复
                             } else {
+                                // 栈为空（可能是从入口函数返回，或者是非敏感上下文），允许通过
                                 traverse(v);
                             }
                         }
+                        // Case C: Intra-procedural (Normal flow)
                         else {
-                            // Handle IntraCFGEdge implicitly here
                             traverse(v);
                         }
                     }
                 }
 
-                // Backtracking
+                // 4. Backtracking
                 trace.pop_back();
                 activeNodes.erase(u);
             };
@@ -94,4 +111,5 @@ void CFGAnalysis::analyze(SVF::ICFG *icfg)
             }
             //@}
         }
+}
 }
